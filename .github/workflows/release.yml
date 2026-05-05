@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v1.0.0
+        required: true
+        type: string
+      prerelease:
+        description: Mark this release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            artifact-name: write4print-windows
+            executable: write4print.exe
+            pyinstaller-extra: --windowed
+          - platform: linux
+            os: ubuntu-latest
+            artifact-name: write4print-linux
+            executable: write4print
+            pyinstaller-extra: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libgl1 libglib2.0-0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: bash
+        run: |
+          pyinstaller \
+            --name write4print \
+            --onefile \
+            ${{ matrix.pyinstaller-extra }} \
+            main.py
+
+      - name: Add Linux desktop launcher
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/${{ matrix.executable }}" release/
+          chmod +x "release/${{ matrix.executable }}"
+          cat > release/write4print.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=write4print
+          Comment=PDF handwriting print converter
+          Exec=write4print
+          Terminal=false
+          Categories=Office;Graphics;
+          DESKTOP
+
+      - name: Collect Windows executable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/${{ matrix.executable }}" release/
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tar -C release -czf "${{ matrix.artifact-name }}.tar.gz" .
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path release\* -DestinationPath "${{ matrix.artifact-name }}.zip"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            ${{ matrix.artifact-name }}.zip
+            ${{ matrix.artifact-name }}.tar.gz
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: write4print ${{ inputs.tag }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: release-assets/*

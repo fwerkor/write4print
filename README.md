@@ -54,6 +54,18 @@ python main.py
 3. 选择输出 PDF 路径
 4. 设置参数后点击“开始转换”
 
+## CI 与发布
+
+仓库包含 GitHub Actions：
+
+- `CI`：在 push、pull request 和手动触发时运行，覆盖 Windows/Linux 与多个 Python 版本，执行依赖安装、语法编译和模块导入检查。
+- `Release`：在 GitHub Actions 页面手动触发，输入发布 tag（例如 `v1.0.0`）后，会自动构建 Windows 和 Linux 二进制包，并发布到 GitHub Release。
+
+发布产物：
+
+- Windows：`write4print.exe`，使用无控制台窗口模式打包，双击运行时不会额外弹出黑窗口。
+- Linux：`write4print` 可执行文件，并附带 `write4print.desktop` 启动文件；通过桌面入口启动时不会打开终端窗口。
+
 ## 参数说明
 
 - `渲染 DPI`：输入 PDF 转图片时的分辨率。越高越清晰，但越慢、内存占用越大。

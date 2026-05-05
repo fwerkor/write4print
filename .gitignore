@@ -2,19 +2,20 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.Python
 
 .venv/
 venv/
 env/
 .vscode/
 
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
 build/
 dist/
 *.spec
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 .DS_Store
 Thumbs.db

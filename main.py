@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
 import queue
 import threading
@@ -988,4 +989,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
