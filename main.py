@@ -25,7 +25,7 @@ A4_H_PT = 841.8897637795277
 class ConvertOptions:
     render_dpi: int = 600
     output_dpi: int = 600
-    margin_mm: float = 12.0
+    margin_mm: float = 24.0
     crop_whitespace: bool = True
     worker_count: int = 0
     opencv_threads: int = 1
@@ -690,7 +690,7 @@ class ConverterApp:
         self.output_var = tk.StringVar()
         self.render_dpi_var = tk.StringVar(value="600")
         self.output_dpi_var = tk.StringVar(value="600")
-        self.margin_var = tk.StringVar(value="12")
+        self.margin_var = tk.StringVar(value="24")
         self.crop_var = tk.BooleanVar(value=True)
         self.worker_count_var = tk.StringVar(value="0")
         self.opencv_threads_var = tk.StringVar(value="1")
@@ -771,7 +771,7 @@ class ConverterApp:
 
         tip = ttk.Label(
             opt,
-            text="建议：普通手写笔记可先用 渲染 DPI=220、输出 DPI=300、页边距=12mm；并行页数=0 表示自动。",
+            text="建议：普通手写笔记可先用 渲染 DPI=220、输出 DPI=300、页边距=24mm；并行页数=0 表示自动。",
             foreground="#555555",
         )
         tip.pack(anchor="w", padx=10, pady=(0, 10))
