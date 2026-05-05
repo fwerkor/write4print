@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import traceback
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Sequence, Tuple
@@ -26,10 +27,74 @@ class ConvertOptions:
     output_dpi: int = 600
     margin_mm: float = 12.0
     crop_whitespace: bool = True
+    worker_count: int = 0
+    opencv_threads: int = 1
+    use_gpu_acceleration: bool = False
+
+
+@dataclass(frozen=True)
+class PageJob:
+    order_idx: int
+    doc_idx: int
+    doc_count: int
+    pdf_path: str
+    page_idx: int
+    doc_pages: int
+
+
+@dataclass
+class ProcessedPage:
+    order_idx: int
+    doc_idx: int
+    doc_count: int
+    pdf_path: str
+    page_idx: int
+    doc_pages: int
+    binary: np.ndarray
 
 
 def mm_to_px(mm: float, dpi: int) -> int:
     return max(0, int(round(mm / 25.4 * dpi)))
+
+
+def _configure_cv2_runtime(options: ConvertOptions) -> str:
+    try:
+        cv2.setUseOptimized(True)
+    except Exception:
+        pass
+
+    if options.opencv_threads > 0:
+        try:
+            cv2.setNumThreads(options.opencv_threads)
+        except Exception:
+            pass
+
+    if not options.use_gpu_acceleration:
+        try:
+            cv2.ocl.setUseOpenCL(False)
+        except Exception:
+            pass
+        return "GPU/OpenCL：关闭"
+
+    opencl_available = False
+    try:
+        opencl_available = bool(cv2.ocl.haveOpenCL())
+        cv2.ocl.setUseOpenCL(opencl_available)
+    except Exception:
+        opencl_available = False
+
+    cuda_devices = 0
+    try:
+        if hasattr(cv2, "cuda"):
+            cuda_devices = int(cv2.cuda.getCudaEnabledDeviceCount())
+    except Exception:
+        cuda_devices = 0
+
+    if opencl_available:
+        return "GPU/OpenCL：已启用 OpenCV OpenCL 加速"
+    if cuda_devices > 0:
+        return "GPU/OpenCL：检测到 CUDA 设备，但当前 OpenCV 未启用 CUDA 算子，已回退 CPU"
+    return "GPU/OpenCL：当前环境不可用，已回退 CPU"
 
 
 def pdf_page_to_gray(page: fitz.Page, dpi: int) -> np.ndarray:
@@ -384,6 +449,62 @@ def add_image_page_to_pdf(out_doc: fitz.Document, gray_page: np.ndarray) -> None
     page.insert_image(page.rect, stream=encoded.tobytes())
 
 
+def _process_pdf_page(job: PageJob, options: ConvertOptions) -> ProcessedPage:
+    _configure_cv2_runtime(options)
+    with fitz.open(job.pdf_path) as src:
+        page = src.load_page(job.page_idx - 1)
+        gray = pdf_page_to_gray(page, dpi=options.render_dpi)
+
+    binary = binarize_handwriting(gray)
+    if options.crop_whitespace:
+        binary = crop_whitespace(binary, pad_px=max(6, options.render_dpi // 30))
+
+    return ProcessedPage(
+        order_idx=job.order_idx,
+        doc_idx=job.doc_idx,
+        doc_count=job.doc_count,
+        pdf_path=job.pdf_path,
+        page_idx=job.page_idx,
+        doc_pages=job.doc_pages,
+        binary=binary,
+    )
+
+
+def _effective_worker_count(options: ConvertOptions, total_pages: int) -> int:
+    if total_pages <= 1:
+        return 1
+    if options.worker_count > 0:
+        return max(1, min(options.worker_count, total_pages))
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(total_pages, 4, max(1, cpu_count - 1)))
+
+
+def _paginate_processed_page(
+    processed: ProcessedPage,
+    paginator: ContinuousPaginator,
+    content_w_px: int,
+    content_h_px: int,
+) -> int:
+    binary = processed.binary
+    local_fragment_count = 0
+    gap_cap = max(0, int(round(content_h_px * 0.015)))
+    for kind, payload, src_width in iter_smart_fragments(binary, content_w_px, content_h_px):
+        if kind == "gap":
+            paginator.add_gap(int(payload), src_width, max_rows=gap_cap)
+        else:
+            paginator.add_fragment(payload)  # type: ignore[arg-type]
+            local_fragment_count += 1
+
+    # 仅加入很小的源页/文档间留白，但不强制换页。
+    if processed.page_idx != processed.doc_pages:
+        paginator.add_gap(max(1, binary.shape[0] // 120), binary.shape[1], max_rows=gap_cap)
+    elif processed.doc_idx != processed.doc_count:
+        paginator.add_gap(max(1, binary.shape[0] // 80), binary.shape[1], max_rows=max(2, gap_cap))
+
+    return local_fragment_count
+
+
 # =========================
 # 转换主逻辑
 # =========================
@@ -415,50 +536,90 @@ def convert_pdfs(
     out = fitz.open()
 
     total_input_pages = 0
-    for pdf_path in input_pdfs:
+    jobs: List[PageJob] = []
+    for doc_idx, pdf_path in enumerate(input_pdfs, start=1):
         with fitz.open(pdf_path) as src:
-            total_input_pages += len(src)
+            doc_pages = len(src)
+            for page_idx in range(1, doc_pages + 1):
+                jobs.append(
+                    PageJob(
+                        order_idx=total_input_pages,
+                        doc_idx=doc_idx,
+                        doc_count=len(input_pdfs),
+                        pdf_path=pdf_path,
+                        page_idx=page_idx,
+                        doc_pages=doc_pages,
+                    )
+                )
+                total_input_pages += 1
 
-    global_page_idx = 0
+    worker_count = _effective_worker_count(options, total_input_pages)
+    runtime_status = _configure_cv2_runtime(options)
+    log(
+        f"运行配置：页级并行={worker_count}，OpenCV线程/进程={max(1, options.opencv_threads)}，"
+        f"{runtime_status}。"
+    )
 
     try:
-        for doc_idx, input_pdf in enumerate(input_pdfs, start=1):
-            with fitz.open(input_pdf) as src:
-                doc_pages = len(src)
-                log(f"开始处理文档 {doc_idx}/{len(input_pdfs)}：{input_pdf}")
-                for page_idx, page in enumerate(src, start=1):
-                    global_page_idx += 1
-                    log(
-                        f"正在处理第 {global_page_idx}/{total_input_pages} 个输入页 "
-                        f"（文档 {doc_idx}/{len(input_pdfs)}，页 {page_idx}/{doc_pages}）：渲染中…"
-                    )
-                    gray = pdf_page_to_gray(page, dpi=options.render_dpi)
+        if worker_count <= 1:
+            for job in jobs:
+                log(
+                    f"正在处理第 {job.order_idx + 1}/{total_input_pages} 个输入页 "
+                    f"（文档 {job.doc_idx}/{job.doc_count}，页 {job.page_idx}/{job.doc_pages}）：渲染与识别中…"
+                )
+                processed = _process_pdf_page(job, options)
+                log("连续排版中…")
+                local_fragment_count = _paginate_processed_page(processed, paginator, content_w_px, content_h_px)
+                log(
+                    f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
+                    f"当前已写满 {len(paginator.pages)} 张整页 A4。"
+                )
+        else:
+            next_submit = 0
+            next_emit = 0
+            completed: dict[int, ProcessedPage] = {}
+            pending: dict[Future[ProcessedPage], PageJob] = {}
+            max_pending = max(1, worker_count * 2)
 
-                    log("识别背景与笔迹…")
-                    binary = binarize_handwriting(gray)
-                    if options.crop_whitespace:
-                        binary = crop_whitespace(binary, pad_px=max(6, options.render_dpi // 30))
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                while next_emit < total_input_pages:
+                    while next_submit < total_input_pages and len(pending) < max_pending:
+                        job = jobs[next_submit]
+                        log(
+                            f"提交第 {job.order_idx + 1}/{total_input_pages} 个输入页 "
+                            f"（文档 {job.doc_idx}/{job.doc_count}，页 {job.page_idx}/{job.doc_pages}）：并行渲染与识别中…"
+                        )
+                        pending[executor.submit(_process_pdf_page, job, options)] = job
+                        next_submit += 1
 
-                    log("连续排版中…")
-                    local_fragment_count = 0
-                    gap_cap = max(0, int(round(content_h_px * 0.015)))
-                    for kind, payload, src_width in iter_smart_fragments(binary, content_w_px, content_h_px):
-                        if kind == "gap":
-                            paginator.add_gap(int(payload), src_width, max_rows=gap_cap)
-                        else:
-                            paginator.add_fragment(payload)  # type: ignore[arg-type]
-                            local_fragment_count += 1
+                    if next_emit not in completed:
+                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            job = pending.pop(future)
+                            processed = future.result()
+                            completed[processed.order_idx] = processed
+                            log(
+                                f"预处理完成第 {job.order_idx + 1}/{total_input_pages} 个输入页 "
+                                f"（文档 {job.doc_idx}/{job.doc_count}，页 {job.page_idx}/{job.doc_pages}）。"
+                            )
 
-                    # 仅加入很小的源页/文档间留白，但不强制换页。
-                    if page_idx != doc_pages:
-                        paginator.add_gap(max(1, binary.shape[0] // 120), binary.shape[1], max_rows=gap_cap)
-                    elif doc_idx != len(input_pdfs):
-                        paginator.add_gap(max(1, binary.shape[0] // 80), binary.shape[1], max_rows=max(2, gap_cap))
-
-                    log(
-                        f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
-                        f"当前已写满 {len(paginator.pages)} 张整页 A4。"
-                    )
+                    while next_emit in completed:
+                        processed = completed.pop(next_emit)
+                        log(
+                            f"按顺序排版第 {processed.order_idx + 1}/{total_input_pages} 个输入页 "
+                            f"（文档 {processed.doc_idx}/{processed.doc_count}，页 {processed.page_idx}/{processed.doc_pages}）…"
+                        )
+                        local_fragment_count = _paginate_processed_page(
+                            processed,
+                            paginator,
+                            content_w_px,
+                            content_h_px,
+                        )
+                        log(
+                            f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
+                            f"当前已写满 {len(paginator.pages)} 张整页 A4。"
+                        )
+                        next_emit += 1
 
         out_count = paginator.finalize_to_pdf(out)
         if out_count <= 0:
@@ -497,6 +658,9 @@ class ConverterApp:
         self.output_dpi_var = tk.StringVar(value="600")
         self.margin_var = tk.StringVar(value="12")
         self.crop_var = tk.BooleanVar(value=True)
+        self.worker_count_var = tk.StringVar(value="0")
+        self.opencv_threads_var = tk.StringVar(value="1")
+        self.gpu_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -550,9 +714,28 @@ class ConverterApp:
 
         ttk.Checkbutton(row, text="裁掉外围空白", variable=self.crop_var).grid(row=0, column=6, sticky="w")
 
+        ttk.Label(row, text="并行页数").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(row, width=8, textvariable=self.worker_count_var).grid(row=1, column=1, padx=(6, 16), pady=(8, 0))
+
+        ttk.Label(row, text="OpenCV线程").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(row, width=8, textvariable=self.opencv_threads_var).grid(
+            row=1,
+            column=3,
+            padx=(6, 16),
+            pady=(8, 0),
+        )
+
+        ttk.Checkbutton(row, text="尝试 GPU/OpenCL 加速", variable=self.gpu_var).grid(
+            row=1,
+            column=4,
+            columnspan=3,
+            sticky="w",
+            pady=(8, 0),
+        )
+
         tip = ttk.Label(
             opt,
-            text="建议：普通手写笔记可先用 渲染 DPI=220、输出 DPI=300、页边距=12mm。若字迹偏细，可把渲染 DPI 调到 260~300。",
+            text="建议：普通手写笔记可先用 渲染 DPI=220、输出 DPI=300、页边距=12mm；并行页数=0 表示自动。",
             foreground="#555555",
         )
         tip.pack(anchor="w", padx=10, pady=(0, 10))
@@ -646,19 +829,28 @@ class ConverterApp:
             render_dpi = int(self.render_dpi_var.get().strip())
             output_dpi = int(self.output_dpi_var.get().strip())
             margin_mm = float(self.margin_var.get().strip())
+            worker_count = int(self.worker_count_var.get().strip())
+            opencv_threads = int(self.opencv_threads_var.get().strip())
         except ValueError as exc:
-            raise ValueError("参数格式不正确，请检查 DPI 和页边距") from exc
+            raise ValueError("参数格式不正确，请检查 DPI、页边距和并行参数") from exc
 
         if render_dpi < 72 or output_dpi < 72:
             raise ValueError("DPI 不能小于 72")
         if margin_mm < 0:
             raise ValueError("页边距不能为负数")
+        if worker_count < 0:
+            raise ValueError("并行页数不能为负数；填 0 表示自动")
+        if opencv_threads < 1:
+            raise ValueError("OpenCV线程不能小于 1")
 
         return ConvertOptions(
             render_dpi=render_dpi,
             output_dpi=output_dpi,
             margin_mm=margin_mm,
             crop_whitespace=bool(self.crop_var.get()),
+            worker_count=worker_count,
+            opencv_threads=opencv_threads,
+            use_gpu_acceleration=bool(self.gpu_var.get()),
         )
 
     def start_convert(self) -> None:
