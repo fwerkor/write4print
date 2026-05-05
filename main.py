@@ -513,6 +513,7 @@ def convert_pdfs(
     output_pdf: str,
     options: ConvertOptions,
     progress: Callable[[str], None] | None = None,
+    progress_value: Callable[[float, str], None] | None = None,
 ) -> None:
     if not input_pdfs:
         raise ValueError("未提供输入 PDF")
@@ -520,6 +521,10 @@ def convert_pdfs(
     def log(msg: str) -> None:
         if progress:
             progress(msg)
+
+    def report_progress(fraction: float, msg: str) -> None:
+        if progress_value:
+            progress_value(min(1.0, max(0.0, fraction)), msg)
 
     input_pdfs = [str(p) for p in input_pdfs]
     output_pdf = str(output_pdf)
@@ -555,25 +560,44 @@ def convert_pdfs(
 
     worker_count = _effective_worker_count(options, total_input_pages)
     runtime_status = _configure_cv2_runtime(options)
+    preprocessed_pages = 0
+    paginated_pages = 0
+
+    def report_page_progress(stage: str) -> None:
+        if total_input_pages <= 0:
+            report_progress(0.0, stage)
+            return
+        fraction = (preprocessed_pages * 0.65 + paginated_pages * 0.30) / total_input_pages
+        report_progress(
+            fraction,
+            f"{stage}（预处理 {preprocessed_pages}/{total_input_pages}，排版 {paginated_pages}/{total_input_pages}）",
+        )
+
     log(
         f"运行配置：页级并行={worker_count}，OpenCV线程/进程={max(1, options.opencv_threads)}，"
         f"{runtime_status}。"
     )
+    report_page_progress("准备处理")
 
     try:
         if worker_count <= 1:
             for job in jobs:
+                report_page_progress(f"正在预处理第 {job.order_idx + 1}/{total_input_pages} 页")
                 log(
                     f"正在处理第 {job.order_idx + 1}/{total_input_pages} 个输入页 "
                     f"（文档 {job.doc_idx}/{job.doc_count}，页 {job.page_idx}/{job.doc_pages}）：渲染与识别中…"
                 )
                 processed = _process_pdf_page(job, options)
+                preprocessed_pages += 1
+                report_page_progress(f"正在排版第 {job.order_idx + 1}/{total_input_pages} 页")
                 log("连续排版中…")
                 local_fragment_count = _paginate_processed_page(processed, paginator, content_w_px, content_h_px)
+                paginated_pages += 1
                 log(
                     f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
                     f"当前已写满 {len(paginator.pages)} 张整页 A4。"
                 )
+                report_page_progress(f"已完成第 {job.order_idx + 1}/{total_input_pages} 页")
         else:
             next_submit = 0
             next_emit = 0
@@ -591,6 +615,7 @@ def convert_pdfs(
                         )
                         pending[executor.submit(_process_pdf_page, job, options)] = job
                         next_submit += 1
+                    report_page_progress(f"已提交 {next_submit}/{total_input_pages} 页")
 
                     if next_emit not in completed:
                         done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -598,13 +623,16 @@ def convert_pdfs(
                             job = pending.pop(future)
                             processed = future.result()
                             completed[processed.order_idx] = processed
+                            preprocessed_pages += 1
                             log(
                                 f"预处理完成第 {job.order_idx + 1}/{total_input_pages} 个输入页 "
                                 f"（文档 {job.doc_idx}/{job.doc_count}，页 {job.page_idx}/{job.doc_pages}）。"
                             )
+                        report_page_progress("并行预处理进行中")
 
                     while next_emit in completed:
                         processed = completed.pop(next_emit)
+                        report_page_progress(f"正在排版第 {processed.order_idx + 1}/{total_input_pages} 页")
                         log(
                             f"按顺序排版第 {processed.order_idx + 1}/{total_input_pages} 个输入页 "
                             f"（文档 {processed.doc_idx}/{processed.doc_count}，页 {processed.page_idx}/{processed.doc_pages}）…"
@@ -619,13 +647,18 @@ def convert_pdfs(
                             f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
                             f"当前已写满 {len(paginator.pages)} 张整页 A4。"
                         )
+                        paginated_pages += 1
                         next_emit += 1
+                        report_page_progress(f"已完成第 {processed.order_idx + 1}/{total_input_pages} 页")
 
+        report_progress(0.96, "正在生成输出 PDF 页面…")
         out_count = paginator.finalize_to_pdf(out)
         if out_count <= 0:
             raise RuntimeError("没有生成任何输出页")
 
+        report_progress(0.98, "正在保存输出 PDF…")
         out.save(output_pdf, deflate=True, garbage=3)
+        report_progress(1.0, "转换完成")
         log(f"完成：共生成 {out_count} 张 A4，输出文件已保存。")
     finally:
         out.close()
@@ -637,8 +670,9 @@ def convert_pdf(
     output_pdf: str,
     options: ConvertOptions,
     progress: Callable[[str], None] | None = None,
+    progress_value: Callable[[float, str], None] | None = None,
 ) -> None:
-    convert_pdfs([input_pdf], output_pdf, options, progress)
+    convert_pdfs([input_pdf], output_pdf, options, progress, progress_value)
 
 
 # =========================
@@ -650,7 +684,7 @@ class ConverterApp:
         self.root.title("PDF 笔记打印转换器")
         self.root.geometry("900x650")
 
-        self.queue: queue.Queue[Tuple[str, str]] = queue.Queue()
+        self.queue: queue.Queue[Tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
 
         self.output_var = tk.StringVar()
@@ -661,6 +695,8 @@ class ConverterApp:
         self.worker_count_var = tk.StringVar(value="0")
         self.opencv_threads_var = tk.StringVar(value="1")
         self.gpu_var = tk.BooleanVar(value=False)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="等待开始")
 
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -739,6 +775,18 @@ class ConverterApp:
             foreground="#555555",
         )
         tip.pack(anchor="w", padx=10, pady=(0, 10))
+
+        # 进度
+        progress_frame = ttk.LabelFrame(main, text="实时进度")
+        progress_frame.pack(fill="x", pady=(10, 0))
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100.0,
+            mode="determinate",
+        )
+        self.progress_bar.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(progress_frame, textvariable=self.progress_text_var).pack(anchor="w", padx=10, pady=(0, 10))
 
         # 操作按钮
         action = ttk.Frame(main)
@@ -820,6 +868,11 @@ class ConverterApp:
         self.log_text.insert("end", text + "\n")
         self.log_text.see("end")
 
+    def set_progress(self, fraction: float, text: str) -> None:
+        percent = min(100.0, max(0.0, fraction * 100.0))
+        self.progress_var.set(percent)
+        self.progress_text_var.set(f"{percent:5.1f}%  {text}")
+
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self.start_btn.configure(state=state)
@@ -879,6 +932,7 @@ class ConverterApp:
         for i, p in enumerate(input_pdfs, start=1):
             self.log(f"  {i}. {p}")
         self.log(f"输出文件：{output_pdf}")
+        self.set_progress(0.0, "准备开始")
 
         def worker() -> None:
             try:
@@ -887,6 +941,7 @@ class ConverterApp:
                     output_pdf=output_pdf,
                     options=options,
                     progress=lambda msg: self.queue.put(("log", msg)),
+                    progress_value=lambda fraction, msg: self.queue.put(("progress", (fraction, msg))),
                 )
                 self.queue.put(("done", output_pdf))
             except Exception:
@@ -904,15 +959,20 @@ class ConverterApp:
                 break
 
             if kind == "log":
-                self.log(payload)
+                self.log(str(payload))
+            elif kind == "progress":
+                fraction, text = payload  # type: ignore[misc]
+                self.set_progress(float(fraction), str(text))
             elif kind == "done":
                 self._set_busy(False)
+                self.set_progress(1.0, "转换完成")
                 self.log("转换完成。")
                 messagebox.showinfo("完成", f"输出已保存到：\n{payload}")
             elif kind == "error":
                 self._set_busy(False)
-                self.log(payload)
-                messagebox.showerror("转换失败", payload)
+                self.progress_text_var.set("转换失败")
+                self.log(str(payload))
+                messagebox.showerror("转换失败", str(payload))
 
         self.root.after(100, self._poll_queue)
 

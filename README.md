@@ -13,6 +13,7 @@
 - 可调渲染 DPI、输出 DPI、页边距
 - 支持页级多进程并行处理，提升多页和高分辨率 PDF 的处理速度
 - 可尝试启用 OpenCV OpenCL/GPU 加速；当前环境不支持时会自动回退 CPU
+- 长任务显示实时百分比进度，并区分预处理、排版和保存阶段
 - 提供简单图形界面，适合直接本地使用
 
 ## 运行环境
@@ -107,7 +108,9 @@ python main.py
 
 如果你想在代码里直接调用，也可以使用：
 
-- `convert_pdfs(input_pdfs, output_pdf, options, progress=None)`
-- `convert_pdf(input_pdf, output_pdf, options, progress=None)`
+- `convert_pdfs(input_pdfs, output_pdf, options, progress=None, progress_value=None)`
+- `convert_pdf(input_pdf, output_pdf, options, progress=None, progress_value=None)`
 
 其中 `options` 类型为 `ConvertOptions`。
+
+`progress` 用于接收日志文本；`progress_value` 用于接收实时数值进度，签名为 `callback(fraction, message)`，其中 `fraction` 范围是 `0.0` 到 `1.0`。
