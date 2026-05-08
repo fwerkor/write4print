@@ -4,6 +4,9 @@ import math
 import multiprocessing
 import os
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import traceback
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -67,6 +70,41 @@ class ProcessedPage:
 
 def mm_to_px(mm: float, dpi: int) -> int:
     return max(0, int(round(mm / 25.4 * dpi)))
+
+
+def reveal_output_file(path: str) -> None:
+    target = Path(path).expanduser()
+    if not target.exists():
+        raise FileNotFoundError(f"输出文件不存在：{target}")
+
+    target = target.resolve()
+    folder = target.parent
+
+    if sys.platform.startswith("win"):
+        subprocess.Popen(["explorer", f"/select,{target}"])
+        return
+
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(target)])
+        return
+
+    linux_selectors = (
+        ("nautilus", ["nautilus", "--select", str(target)]),
+        ("dolphin", ["dolphin", "--select", str(target)]),
+        ("nemo", ["nemo", str(folder)]),
+        ("caja", ["caja", str(folder)]),
+        ("thunar", ["thunar", str(folder)]),
+    )
+    for executable, command in linux_selectors:
+        if shutil.which(executable):
+            subprocess.Popen(command)
+            return
+
+    if shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", str(folder)])
+        return
+
+    raise RuntimeError("未找到可用的文件管理器，无法打开输出文件夹")
 
 
 def _configure_cv2_runtime(opencv_threads: int, use_opencl: bool = False) -> str:
@@ -854,6 +892,7 @@ class ConverterApp:
         self.crop_var = tk.BooleanVar(value=True)
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="等待开始")
+        self.last_output_pdf: str | None = None
 
         self._build_ui()
         self.root.after(100, self._poll_queue)
@@ -931,6 +970,9 @@ class ConverterApp:
         action.pack(fill="x", pady=(10, 0))
         self.start_btn = ttk.Button(action, text="开始转换", command=self.start_convert)
         self.start_btn.pack(side="left")
+        self.open_output_btn = ttk.Button(action, text="打开输出位置", command=self.open_output_location)
+        self.open_output_btn.pack(side="left", padx=(8, 0))
+        self.open_output_btn.configure(state="disabled")
 
         # 日志
         logf = ttk.LabelFrame(main, text="日志")
@@ -1014,6 +1056,19 @@ class ConverterApp:
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self.start_btn.configure(state=state)
+        output_state = "normal" if (not busy and self.last_output_pdf) else "disabled"
+        self.open_output_btn.configure(state=output_state)
+
+    def open_output_location(self) -> None:
+        output_pdf = self.last_output_pdf or self.output_var.get().strip()
+        if not output_pdf:
+            messagebox.showinfo("提示", "还没有可打开的输出文件")
+            return
+
+        try:
+            reveal_output_file(output_pdf)
+        except Exception as exc:
+            messagebox.showerror("打开失败", str(exc))
 
     def _read_options(self) -> ConvertOptions:
         try:
@@ -1057,6 +1112,8 @@ class ConverterApp:
             return
 
         self.log_text.delete("1.0", "end")
+        self.last_output_pdf = None
+        self.open_output_btn.configure(state="disabled")
         self.log("开始转换，输入文件顺序如下：")
         for i, p in enumerate(input_pdfs, start=1):
             self.log(f"  {i}. {p}")
@@ -1093,10 +1150,11 @@ class ConverterApp:
                 fraction, text = payload  # type: ignore[misc]
                 self.set_progress(float(fraction), str(text))
             elif kind == "done":
+                self.last_output_pdf = str(payload)
                 self._set_busy(False)
                 self.set_progress(1.0, "转换完成")
                 self.log("转换完成。")
-                messagebox.showinfo("完成", f"输出已保存到：\n{payload}")
+                messagebox.showinfo("完成", f"输出已保存到：\n{payload}\n\n可点击“打开输出位置”定位该文件。")
             elif kind == "error":
                 self._set_busy(False)
                 self.progress_text_var.set("转换失败")
