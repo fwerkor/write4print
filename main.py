@@ -28,9 +28,20 @@ class ConvertOptions:
     output_dpi: int = 600
     margin_mm: float = 24.0
     crop_whitespace: bool = True
+    # Kept for compatibility with older direct callers. The GUI no longer exposes
+    # these knobs; convert_pdfs builds an automatic runtime plan per job.
     worker_count: int = 0
-    opencv_threads: int = 1
+    opencv_threads: int = 0
     use_gpu_acceleration: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimePlan:
+    worker_count: int
+    opencv_threads: int
+    max_pending: int
+    use_opencl: bool
+    status: str
 
 
 @dataclass(frozen=True)
@@ -58,24 +69,23 @@ def mm_to_px(mm: float, dpi: int) -> int:
     return max(0, int(round(mm / 25.4 * dpi)))
 
 
-def _configure_cv2_runtime(options: ConvertOptions) -> str:
+def _configure_cv2_runtime(opencv_threads: int, use_opencl: bool = False) -> str:
     try:
         cv2.setUseOptimized(True)
     except Exception:
         pass
 
-    if options.opencv_threads > 0:
-        try:
-            cv2.setNumThreads(options.opencv_threads)
-        except Exception:
-            pass
+    try:
+        cv2.setNumThreads(max(1, int(opencv_threads)))
+    except Exception:
+        pass
 
-    if not options.use_gpu_acceleration:
+    if not use_opencl:
         try:
             cv2.ocl.setUseOpenCL(False)
         except Exception:
             pass
-        return "GPU/OpenCL：关闭"
+        return "OpenCL/GPU：自动关闭（当前图像管线使用 CPU 更稳定）"
 
     opencl_available = False
     try:
@@ -98,15 +108,82 @@ def _configure_cv2_runtime(options: ConvertOptions) -> str:
     return "GPU/OpenCL：当前环境不可用，已回退 CPU"
 
 
+def _init_worker_runtime(opencv_threads: int, use_opencl: bool) -> None:
+    _configure_cv2_runtime(opencv_threads, use_opencl)
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages * page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+
+def _estimate_a4_pixels(dpi: int) -> int:
+    w = int(round(A4_W_PT / 72.0 * dpi))
+    h = int(round(A4_H_PT / 72.0 * dpi))
+    return max(1, w * h)
+
+
+def _estimate_worker_memory_bytes(dpi: int) -> int:
+    # Each worker may briefly hold gray, binary, adaptive/global intermediates,
+    # and optional connected-component labels. Keep the estimate conservative.
+    pixels = _estimate_a4_pixels(dpi)
+    return int(pixels * 8 + 160 * 1024 * 1024)
+
+
+def _auto_runtime_plan(options: ConvertOptions, total_pages: int) -> RuntimePlan:
+    cpu_count = max(1, os.cpu_count() or 1)
+    if total_pages <= 1:
+        pixel_count = _estimate_a4_pixels(options.render_dpi)
+        opencv_threads = 1 if pixel_count < 4_000_000 else min(cpu_count, 4)
+        return RuntimePlan(
+            worker_count=1,
+            opencv_threads=max(1, opencv_threads),
+            max_pending=1,
+            use_opencl=False,
+            status="单页直通处理",
+        )
+
+    if options.render_dpi >= 500:
+        worker_ceiling = min(cpu_count, 8)
+    elif options.render_dpi >= 300:
+        worker_ceiling = min(cpu_count, 10)
+    else:
+        worker_ceiling = min(cpu_count, 12)
+
+    target_workers = min(total_pages, worker_ceiling)
+    available = _available_memory_bytes()
+    if available:
+        per_worker = _estimate_worker_memory_bytes(options.render_dpi)
+        memory_workers = max(1, int(available * 0.65 // per_worker))
+        target_workers = min(target_workers, memory_workers)
+
+    worker_count = max(1, target_workers)
+    opencv_threads = max(1, min(2, cpu_count // worker_count))
+    max_pending = worker_count + 1
+    return RuntimePlan(
+        worker_count=worker_count,
+        opencv_threads=opencv_threads,
+        max_pending=max_pending,
+        use_opencl=False,
+        status="多页自动并行处理",
+    )
+
+
 def pdf_page_to_gray(page: fitz.Page, dpi: int) -> np.ndarray:
     scale = dpi / 72.0
     mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8)
-    arr = arr.reshape(pix.height, pix.width, pix.n)
     if pix.n == 1:
-        gray = arr.copy()
+        gray = arr.reshape(pix.height, pix.width).copy()
     else:
+        arr = arr.reshape(pix.height, pix.width, pix.n)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     return gray
 
@@ -114,28 +191,90 @@ def pdf_page_to_gray(page: fitz.Page, dpi: int) -> np.ndarray:
 # =========================
 # 二值化与裁边
 # =========================
-def _otsu_polarity(gray: np.ndarray) -> Tuple[int, bool]:
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    th, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    border = np.concatenate(
-        [
-            gray[0, :],
-            gray[-1, :],
-            gray[:, 0],
-            gray[:, -1],
-        ]
+def _otsu_threshold(gray: np.ndarray) -> int:
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    total = float(gray.size)
+    if total <= 0:
+        return 127
+
+    bins = np.arange(256, dtype=np.float64)
+    weight_bg = np.cumsum(hist)
+    weight_fg = total - weight_bg
+    sum_bg = np.cumsum(hist * bins)
+    sum_total = float(sum_bg[-1])
+
+    valid = (weight_bg > 0) & (weight_fg > 0)
+    scores = np.full(256, -1.0, dtype=np.float64)
+    numerator = (sum_total * weight_bg[valid] - sum_bg[valid] * total) ** 2
+    scores[valid] = numerator / (weight_bg[valid] * weight_fg[valid])
+    return int(np.argmax(scores))
+
+
+def _border_mean(gray: np.ndarray) -> float:
+    h, w = gray.shape
+    if h == 0 or w == 0:
+        return 0.0
+    if h == 1:
+        return float(gray[0, :].mean())
+    if w == 1:
+        return float(gray[:, 0].mean())
+
+    total = (
+        int(gray[0, :].sum())
+        + int(gray[-1, :].sum())
+        + int(gray[1:-1, 0].sum())
+        + int(gray[1:-1, -1].sum())
     )
-    border_mean = float(border.mean()) if border.size else float(gray.mean())
+    count = 2 * w + 2 * (h - 2)
+    return float(total / max(1, count))
+
+
+def _analysis_sample(gray: np.ndarray, max_dim: int = 768) -> np.ndarray:
+    h, w = gray.shape
+    longest = max(h, w)
+    if longest <= max_dim:
+        return gray
+    scale = max_dim / float(longest)
+    size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    return cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+
+
+def _otsu_polarity(gray: np.ndarray) -> Tuple[int, bool]:
+    th = _otsu_threshold(gray)
+    border_mean = _border_mean(gray)
 
     # 边缘通常更接近背景；若不明显，再回退到“大类即背景”的假设。
     if abs(border_mean - th) >= 8:
         background_is_white = border_mean > th
     else:
-        low = int((blur <= th).sum())
-        high = int((blur > th).sum())
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+        low = int(hist[: th + 1].sum())
+        high = int(hist[th + 1 :].sum())
         background_is_white = high >= low
 
     return int(th), background_is_white
+
+
+def _needs_adaptive_threshold(gray: np.ndarray, th: int, background_is_white: bool) -> bool:
+    sample = _analysis_sample(gray)
+    if sample.size == 0:
+        return False
+
+    if background_is_white:
+        bg_mask = sample >= min(255, th + 10)
+    else:
+        bg_mask = sample <= max(0, th - 10)
+
+    bg_coverage = float(np.count_nonzero(bg_mask)) / float(sample.size)
+    if bg_coverage < 0.35:
+        return True
+
+    bg_values = sample[bg_mask]
+    bg_std = float(bg_values.std()) if bg_values.size else 0.0
+    delta = np.abs(sample.astype(np.int16) - int(th))
+    near_threshold = float(np.count_nonzero(delta <= 22)) / float(sample.size)
+
+    return bg_std > 10.0 or near_threshold > 0.025
 
 
 def _remove_tiny_components(binary: np.ndarray) -> np.ndarray:
@@ -147,12 +286,16 @@ def _remove_tiny_components(binary: np.ndarray) -> np.ndarray:
 
     h, w = binary.shape
     min_area = max(2, int(round(h * w * 0.000002)))
-    keep = np.zeros_like(inv)
-    for i in range(1, num):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area >= min_area:
-            keep[labels == i] = 255
-    return 255 - keep
+    keep_labels = stats[:, cv2.CC_STAT_AREA] >= min_area
+    keep_labels[0] = False
+    if bool(np.all(keep_labels[1:])):
+        return binary
+
+    keep = keep_labels[labels]
+    cleaned = np.empty_like(binary)
+    cleaned.fill(255)
+    cleaned[keep] = 0
+    return cleaned
 
 
 def binarize_handwriting(gray: np.ndarray) -> np.ndarray:
@@ -160,41 +303,59 @@ def binarize_handwriting(gray: np.ndarray) -> np.ndarray:
     th, background_is_white = _otsu_polarity(gray)
 
     mode = cv2.THRESH_BINARY if background_is_white else cv2.THRESH_BINARY_INV
-    _, global_bin = cv2.threshold(gray, th, 255, mode)
+    _, binary = cv2.threshold(gray, th, 255, mode)
 
-    # 自适应阈值用于处理局部亮度不均。保持同一极性：255 背景，0 笔迹。
-    block = max(31, (min(gray.shape[:2]) // 20) | 1)
-    if block % 2 == 0:
-        block += 1
-    adaptive = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        mode,
-        block,
-        15,
-    )
+    if _needs_adaptive_threshold(gray, th, background_is_white):
+        # 自适应阈值用于处理局部亮度不均。保持同一极性：255 背景，0 笔迹。
+        block = max(31, (min(gray.shape[:2]) // 20) | 1)
+        if block % 2 == 0:
+            block += 1
+        adaptive = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            mode,
+            block,
+            15,
+        )
 
-    # 取“更保守”的交集，减少灰边与阴影进入前景。
-    binary = cv2.bitwise_or(global_bin, adaptive)
+        # 取“更保守”的交集，减少灰边与阴影进入前景。
+        cv2.bitwise_or(binary, adaptive, dst=binary)
 
     # 轻微闭运算，修补断裂；再次阈值确保纯黑白。
     kernel = np.ones((2, 2), dtype=np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
     _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
-    binary = _remove_tiny_components(binary)
     return binary
 
 
+def ink_count_axis(binary: np.ndarray, axis: int) -> np.ndarray:
+    if axis == 1:
+        sums = cv2.reduce(binary, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32S).ravel()
+        total = binary.shape[1] * 255
+    elif axis == 0:
+        sums = cv2.reduce(binary, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32S).ravel()
+        total = binary.shape[0] * 255
+    else:
+        raise ValueError("axis must be 0 or 1")
+    return ((total - sums) // 255).astype(np.int32, copy=False)
+
+
 def crop_whitespace(binary: np.ndarray, pad_px: int = 8) -> np.ndarray:
-    ink = np.where(binary < 250)
-    if len(ink[0]) == 0:
+    row_counts = ink_count_axis(binary, axis=1)
+    col_counts = ink_count_axis(binary, axis=0)
+    row_threshold = max(1, int(round(binary.shape[1] * 0.0005)))
+    col_threshold = max(1, int(round(binary.shape[0] * 0.0005)))
+    rows = np.flatnonzero(row_counts >= row_threshold)
+    cols = np.flatnonzero(col_counts >= col_threshold)
+
+    if rows.size == 0 or cols.size == 0:
         return binary
 
-    y0 = max(0, int(ink[0].min()) - pad_px)
-    y1 = min(binary.shape[0], int(ink[0].max()) + 1 + pad_px)
-    x0 = max(0, int(ink[1].min()) - pad_px)
-    x1 = min(binary.shape[1], int(ink[1].max()) + 1 + pad_px)
+    y0 = max(0, int(rows[0]) - pad_px)
+    y1 = min(binary.shape[0], int(rows[-1]) + 1 + pad_px)
+    x0 = max(0, int(cols[0]) - pad_px)
+    x1 = min(binary.shape[1], int(cols[-1]) + 1 + pad_px)
     return binary[y0:y1, x0:x1].copy()
 
 
@@ -202,7 +363,7 @@ def crop_whitespace(binary: np.ndarray, pad_px: int = 8) -> np.ndarray:
 # 行/片段分析
 # =========================
 def row_ink_count(binary: np.ndarray) -> np.ndarray:
-    return np.count_nonzero(binary < 250, axis=1)
+    return ink_count_axis(binary, axis=1)
 
 
 def detect_bands(binary: np.ndarray) -> List[Tuple[int, int]]:
@@ -324,16 +485,17 @@ def iter_smart_fragments(
 # 连续排版到 A4
 # =========================
 class ContinuousPaginator:
-    def __init__(self, a4_w_px: int, a4_h_px: int, margin_px: int):
+    def __init__(self, a4_w_px: int, a4_h_px: int, margin_px: int, out_doc: fitz.Document):
         self.a4_w_px = a4_w_px
         self.a4_h_px = a4_h_px
         self.margin_px = margin_px
+        self.out_doc = out_doc
         self.content_w_px = a4_w_px - 2 * margin_px
         self.content_h_px = a4_h_px - 2 * margin_px
         if self.content_w_px <= 0 or self.content_h_px <= 0:
             raise ValueError("页边距过大，导致 A4 可用区域为 0")
 
-        self.pages: List[np.ndarray] = []
+        self.output_page_count = 0
         self._reset_current_page()
 
     def _reset_current_page(self) -> None:
@@ -347,7 +509,8 @@ class ContinuousPaginator:
 
     def _flush_current_page(self) -> None:
         if self.page_has_content:
-            self.pages.append(self.current.copy())
+            add_image_page_to_pdf(self.out_doc, self.current)
+            self.output_page_count += 1
         self._reset_current_page()
 
     def add_gap(self, src_rows: int, src_width: int, max_rows: int = 0) -> None:
@@ -375,9 +538,11 @@ class ContinuousPaginator:
                 self._flush_current_page()
 
     def _resize_fragment(self, fragment: np.ndarray) -> np.ndarray:
+        if fragment.shape[1] == self.content_w_px:
+            return fragment
         scale = self.content_w_px / float(fragment.shape[1])
         resized_h = max(1, int(round(fragment.shape[0] * scale)))
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
         resized = cv2.resize(fragment, (self.content_w_px, resized_h), interpolation=interp)
         _, resized = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
         return resized
@@ -432,18 +597,16 @@ class ContinuousPaginator:
             self.add_fragment(sub)
             start = cut
 
-    def finalize_to_pdf(self, out_doc: fitz.Document) -> int:
+    def finalize_to_pdf(self) -> int:
         if self.page_has_content:
-            self.pages.append(self.current.copy())
+            add_image_page_to_pdf(self.out_doc, self.current)
+            self.output_page_count += 1
             self._reset_current_page()
-
-        for page_img in self.pages:
-            add_image_page_to_pdf(out_doc, page_img)
-        return len(self.pages)
+        return self.output_page_count
 
 
 def add_image_page_to_pdf(out_doc: fitz.Document, gray_page: np.ndarray) -> None:
-    success, encoded = cv2.imencode(".png", gray_page)
+    success, encoded = cv2.imencode(".png", gray_page, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not success:
         raise RuntimeError("PNG 编码失败")
     page = out_doc.new_page(width=A4_W_PT, height=A4_H_PT)
@@ -451,7 +614,6 @@ def add_image_page_to_pdf(out_doc: fitz.Document, gray_page: np.ndarray) -> None
 
 
 def _process_pdf_page(job: PageJob, options: ConvertOptions) -> ProcessedPage:
-    _configure_cv2_runtime(options)
     with fitz.open(job.pdf_path) as src:
         page = src.load_page(job.page_idx - 1)
         gray = pdf_page_to_gray(page, dpi=options.render_dpi)
@@ -459,6 +621,7 @@ def _process_pdf_page(job: PageJob, options: ConvertOptions) -> ProcessedPage:
     binary = binarize_handwriting(gray)
     if options.crop_whitespace:
         binary = crop_whitespace(binary, pad_px=max(6, options.render_dpi // 30))
+    binary = _remove_tiny_components(binary)
 
     return ProcessedPage(
         order_idx=job.order_idx,
@@ -469,16 +632,6 @@ def _process_pdf_page(job: PageJob, options: ConvertOptions) -> ProcessedPage:
         doc_pages=job.doc_pages,
         binary=binary,
     )
-
-
-def _effective_worker_count(options: ConvertOptions, total_pages: int) -> int:
-    if total_pages <= 1:
-        return 1
-    if options.worker_count > 0:
-        return max(1, min(options.worker_count, total_pages))
-
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(total_pages, 4, max(1, cpu_count - 1)))
 
 
 def _paginate_processed_page(
@@ -538,9 +691,6 @@ def convert_pdfs(
     if content_w_px <= 0 or content_h_px <= 0:
         raise ValueError("页边距过大，导致 A4 可用区域为 0")
 
-    paginator = ContinuousPaginator(a4_w_px=a4_w_px, a4_h_px=a4_h_px, margin_px=margin_px)
-    out = fitz.open()
-
     total_input_pages = 0
     jobs: List[PageJob] = []
     for doc_idx, pdf_path in enumerate(input_pdfs, start=1):
@@ -559,8 +709,12 @@ def convert_pdfs(
                 )
                 total_input_pages += 1
 
-    worker_count = _effective_worker_count(options, total_input_pages)
-    runtime_status = _configure_cv2_runtime(options)
+    out = fitz.open()
+    paginator = ContinuousPaginator(a4_w_px=a4_w_px, a4_h_px=a4_h_px, margin_px=margin_px, out_doc=out)
+
+    runtime = _auto_runtime_plan(options, total_input_pages)
+    worker_count = runtime.worker_count
+    runtime_status = _configure_cv2_runtime(runtime.opencv_threads, runtime.use_opencl)
     preprocessed_pages = 0
     paginated_pages = 0
 
@@ -575,7 +729,8 @@ def convert_pdfs(
         )
 
     log(
-        f"运行配置：页级并行={worker_count}，OpenCV线程/进程={max(1, options.opencv_threads)}，"
+        f"运行配置：{runtime.status}，页级并行={worker_count}，"
+        f"OpenCV线程/处理单元={runtime.opencv_threads}，待处理队列上限={runtime.max_pending}，"
         f"{runtime_status}。"
     )
     report_page_progress("准备处理")
@@ -596,7 +751,7 @@ def convert_pdfs(
                 paginated_pages += 1
                 log(
                     f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
-                    f"当前已写满 {len(paginator.pages)} 张整页 A4。"
+                    f"当前已写入 {paginator.output_page_count} 张整页 A4。"
                 )
                 report_page_progress(f"已完成第 {job.order_idx + 1}/{total_input_pages} 页")
         else:
@@ -604,9 +759,13 @@ def convert_pdfs(
             next_emit = 0
             completed: dict[int, ProcessedPage] = {}
             pending: dict[Future[ProcessedPage], PageJob] = {}
-            max_pending = max(1, worker_count * 2)
+            max_pending = runtime.max_pending
 
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_init_worker_runtime,
+                initargs=(runtime.opencv_threads, runtime.use_opencl),
+            ) as executor:
                 while next_emit < total_input_pages:
                     while next_submit < total_input_pages and len(pending) < max_pending:
                         job = jobs[next_submit]
@@ -646,14 +805,14 @@ def convert_pdfs(
                         )
                         log(
                             f"当前输入页完成，已抽取 {local_fragment_count} 个内容片段；"
-                            f"当前已写满 {len(paginator.pages)} 张整页 A4。"
+                            f"当前已写入 {paginator.output_page_count} 张整页 A4。"
                         )
                         paginated_pages += 1
                         next_emit += 1
                         report_page_progress(f"已完成第 {processed.order_idx + 1}/{total_input_pages} 页")
 
         report_progress(0.96, "正在生成输出 PDF 页面…")
-        out_count = paginator.finalize_to_pdf(out)
+        out_count = paginator.finalize_to_pdf()
         if out_count <= 0:
             raise RuntimeError("没有生成任何输出页")
 
@@ -693,9 +852,6 @@ class ConverterApp:
         self.output_dpi_var = tk.StringVar(value="600")
         self.margin_var = tk.StringVar(value="24")
         self.crop_var = tk.BooleanVar(value=True)
-        self.worker_count_var = tk.StringVar(value="0")
-        self.opencv_threads_var = tk.StringVar(value="1")
-        self.gpu_var = tk.BooleanVar(value=False)
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="等待开始")
 
@@ -751,28 +907,9 @@ class ConverterApp:
 
         ttk.Checkbutton(row, text="裁掉外围空白", variable=self.crop_var).grid(row=0, column=6, sticky="w")
 
-        ttk.Label(row, text="并行页数").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(row, width=8, textvariable=self.worker_count_var).grid(row=1, column=1, padx=(6, 16), pady=(8, 0))
-
-        ttk.Label(row, text="OpenCV线程").grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(row, width=8, textvariable=self.opencv_threads_var).grid(
-            row=1,
-            column=3,
-            padx=(6, 16),
-            pady=(8, 0),
-        )
-
-        ttk.Checkbutton(row, text="尝试 GPU/OpenCL 加速", variable=self.gpu_var).grid(
-            row=1,
-            column=4,
-            columnspan=3,
-            sticky="w",
-            pady=(8, 0),
-        )
-
         tip = ttk.Label(
             opt,
-            text="建议：普通手写笔记可先用 渲染 DPI=220、输出 DPI=300、页边距=24mm；并行页数=0 表示自动。",
+            text="默认保留 600/600 DPI；如更看重速度和体积，可手动降低到 300 DPI。",
             foreground="#555555",
         )
         tip.pack(anchor="w", padx=10, pady=(0, 10))
@@ -883,28 +1020,19 @@ class ConverterApp:
             render_dpi = int(self.render_dpi_var.get().strip())
             output_dpi = int(self.output_dpi_var.get().strip())
             margin_mm = float(self.margin_var.get().strip())
-            worker_count = int(self.worker_count_var.get().strip())
-            opencv_threads = int(self.opencv_threads_var.get().strip())
         except ValueError as exc:
-            raise ValueError("参数格式不正确，请检查 DPI、页边距和并行参数") from exc
+            raise ValueError("参数格式不正确，请检查 DPI 和页边距") from exc
 
         if render_dpi < 72 or output_dpi < 72:
             raise ValueError("DPI 不能小于 72")
         if margin_mm < 0:
             raise ValueError("页边距不能为负数")
-        if worker_count < 0:
-            raise ValueError("并行页数不能为负数；填 0 表示自动")
-        if opencv_threads < 1:
-            raise ValueError("OpenCV线程不能小于 1")
 
         return ConvertOptions(
             render_dpi=render_dpi,
             output_dpi=output_dpi,
             margin_mm=margin_mm,
             crop_whitespace=bool(self.crop_var.get()),
-            worker_count=worker_count,
-            opencv_threads=opencv_threads,
-            use_gpu_acceleration=bool(self.gpu_var.get()),
         )
 
     def start_convert(self) -> None:
